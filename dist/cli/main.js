@@ -4,14 +4,16 @@
  * each module exports
  *   main(argv: string[], context: { dbPath: string; command: string }): Promise<number>.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { Bus } from "../core/bus.js";
 import { ChangeWatcher } from "../core/changes.js";
 import { homeFor, resolveDbPath } from "../core/db.js";
-import { agentIdFromEnv } from "../core/identity.js";
+import { agentIdFromEnv, tokenPathFor } from "../core/identity.js";
 import { defaultImportSources, runImport } from "../core/import.js";
 import { waitForMail, waitSeconds } from "../notify/wait.js";
-import { BusError, OPERATOR_ID } from "../core/types.js";
+import { BusError, MAX_WAIT_SEC, OPERATOR_ID, STALE_AGENT_MS } from "../core/types.js";
+import { claudeCodeSettings, renderWake, waitForWake } from "../hook/claude-code.js";
+import { taskAttention } from "../attention.js";
 import { ensureTaskWorktree, pruneTaskWorktrees, removeTaskWorktree, repoRootFor } from "../worktree.js";
 import { renderAgents, renderEvent, renderImport, renderMessages, renderStatus, renderTask, renderTasks, renderTrace, renderTraceHtml } from "./format.js";
 const defaultIo = {
@@ -20,7 +22,7 @@ const defaultIo = {
     readStdin: () => readFileSync(0, "utf8"),
     env: process.env,
 };
-const BOOLEAN_FLAGS = new Set(["json", "peek", "all", "mine", "ack", "accept", "revise", "dry-run", "force", "follow", "operator", "open", "help", "worktree", "remove"]);
+const BOOLEAN_FLAGS = new Set(["json", "peek", "all", "mine", "ack", "accept", "revise", "dry-run", "force", "follow", "operator", "open", "help", "worktree", "remove", "settings"]);
 const REPEATED_FLAGS = new Set(["dep", "scope", "state", "file"]);
 export function parseArgs(argv) {
     const positionals = [];
@@ -76,6 +78,7 @@ Global: --db PATH (or QAGENT_BUS_DB; default ~/.agent-bus/bus.db)  --as ID|opera
   qagent inbox [--peek] [--limit N]
   qagent ack <seq>
   qagent wait [--timeout SEC]                     exit 0 = mail or task event, 2 = timeout
+  qagent hook claude-code [--timeout SEC] [--settings]   Claude Code Stop hook: exit 2 wakes the session on new mail
   qagent task add <title> [--brief B|-] [--to ID] [--reviewer ID] [--role R] [--priority P]
                   [--acceptance A] [--parent N] [--dep N]... [--scope PATH]... [--project DIR]
   qagent task list [--mine] [--state S]... [--all] [--limit N] | task show <N>
@@ -135,7 +138,7 @@ class Context {
         return value;
     }
     taskId(index) {
-        const raw = this.position(index, "task number").replace(/^#/, "");
+        const raw = this.position(index, "task number").replace(/^(#|task-)/, "");
         const id = Number(raw);
         if (!Number.isInteger(id) || id <= 0)
             throw new BusError("invalid", `invalid task number: ${raw}`);
@@ -220,6 +223,41 @@ async function waitCommand(ctx) {
         if (interrupted)
             return 130;
         return result.status === "timeout" ? 2 : 0;
+    }
+    finally {
+        process.off("SIGINT", stop);
+        process.off("SIGTERM", stop);
+    }
+}
+/** `qagent hook claude-code` (see src/hook/claude-code.ts): exit 2 with headers on stderr wakes the session; 0 otherwise. */
+async function hookCommand(ctx) {
+    const name = ctx.position(1, "hook name (claude-code)");
+    if (name !== "claude-code")
+        throw new BusError("invalid", `unknown hook: ${name} (expected claude-code)`);
+    const seconds = waitSeconds(ctx.int("timeout") ?? MAX_WAIT_SEC, ctx.io.env);
+    if (ctx.flag("settings") === true) {
+        const agentId = ctx.str("as") ?? agentIdFromEnv(ctx.io.env);
+        if (!agentId)
+            throw new BusError("invalid", "pass --as <id> (or set QAGENT_AGENT_ID)");
+        const settings = claudeCodeSettings(agentId, ctx.dbPath, seconds);
+        const tokenPath = tokenPathFor(homeFor(ctx.dbPath), agentId);
+        if (!existsSync(tokenPath))
+            ctx.io.stderr(`qagent: warning: no token file at ${tokenPath}; run \`qagent agent add ${agentId} --role ...\` first.\n`);
+        ctx.io.stderr("# merge into .claude/settings.json (this project) or ~/.claude/settings.json (every project)\n");
+        ctx.io.stdout(`${JSON.stringify(settings, null, 2)}\n`);
+        return 0;
+    }
+    const me = ctx.identity();
+    const controller = new AbortController();
+    const stop = () => controller.abort();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+    try {
+        const result = await waitForWake(ctx.bus, me, { timeoutMs: seconds * 1000, signal: controller.signal });
+        if (result.status !== "mail")
+            return 0;
+        ctx.io.stderr(renderWake(me.agentId, result));
+        return 2;
     }
     finally {
         process.off("SIGINT", stop);
@@ -334,6 +372,8 @@ async function dispatch(ctx) {
             ctx.out(result, `acknowledged #${result.seq}`);
             return 0;
         }
+        case "hook":
+            return hookCommand(ctx);
         case "wait":
             return waitCommand(ctx);
         case "log":
@@ -342,22 +382,23 @@ async function dispatch(ctx) {
             return taskCommand(ctx, sub);
         case "trace": {
             const trace = ctx.bus.traceTask(ctx.taskId(1));
+            const now = taskAttention(ctx.bus, trace.task, STALE_AGENT_MS);
             const format = ctx.str("format") ?? (ctx.str("out")?.endsWith(".html") ? "html" : "text");
             if (format === "html") {
                 const out = ctx.str("out");
                 if (!out)
                     throw new BusError("invalid", "--format html requires --out FILE");
-                writeFileSync(out, renderTraceHtml(trace), { mode: 0o600 });
+                writeFileSync(out, renderTraceHtml(trace, now), { mode: 0o600 });
                 ctx.out({ out }, `wrote ${out}`);
                 return 0;
             }
             if (format === "json") {
-                console.log(JSON.stringify(trace, null, 2));
+                console.log(JSON.stringify({ ...trace, now }, null, 2));
                 return 0;
             }
             if (format !== "text")
                 throw new BusError("invalid", "--format must be text, json, or html");
-            ctx.out(trace, renderTrace(trace));
+            ctx.out({ ...trace, now }, renderTrace(trace, now));
             return 0;
         }
         case "import": {
